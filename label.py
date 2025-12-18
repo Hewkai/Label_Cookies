@@ -40,6 +40,8 @@ COOKIEPEDIA_CACHE  = {}
 
 # สำหรับ rate limit ของ cookiepedia
 COOKIEPEDIA_LAST_CALL = 0.0   # timestamp ล่าสุดที่ยิง cookiepedia
+COOKIEPEDIA_CALLS_IN_MIN = []
+
 
 # log file สำหรับความคืบหน้า
 LOG_FILE = "label_progress.log"
@@ -235,20 +237,48 @@ def check_cookiesearch(cookie_name: str):
 #   - DB preload cache
 #   - เพื่อลด limit rate
 
-def _respect_cookiepedia_rate_limit():
-    """บังคับให้ไม่เกิน ~3 request/sec + random delay เล็กน้อย"""
-    global COOKIEPEDIA_LAST_CALL
+def cookiepedia_rate_limit():
+    """
+    Enforce:
+      - minimum 1 second between requests
+      - optional: max X requests per minute (here: 60)
+    """
+    global COOKIEPEDIA_LAST_CALL, COOKIEPEDIA_CALLS_IN_MIN
     now = time.time()
-    min_interval = 1.0 / 3.0  # 3 req/sec
+
+    # Keep only last 60 sec timestamps
+    COOKIEPEDIA_CALLS_IN_MIN = [t for t in COOKIEPEDIA_CALLS_IN_MIN if now - t < 60]
+
+    # 1 request per second → interval = 1 request 60 seconds
+    MIN_INTERVAL = 60.0
+
     elapsed = now - COOKIEPEDIA_LAST_CALL
+    if elapsed < MIN_INTERVAL:
+        time.sleep(MIN_INTERVAL - elapsed)
 
-    if elapsed < min_interval:
-        time.sleep(min_interval - elapsed)
-
-    # random jitter เพื่อลด pattern ที่คงที่เกินไป
-    time.sleep(random.uniform(0.0, 0.3))
-
+    # Optional: max 60 req/min (not really needed but keeps list clean)
+    COOKIEPEDIA_CALLS_IN_MIN.append(time.time())
     COOKIEPEDIA_LAST_CALL = time.time()
+
+
+
+COOKIEPEDIA_LAST_CALL = time.time()
+COOKIEPEDIA_CALLS_IN_MIN.append(COOKIEPEDIA_LAST_CALL)
+
+# def _respect_cookiepedia_rate_limit():
+#     """บังคับให้ไม่เกิน ~3 request/sec + random delay เล็กน้อย"""
+#     global COOKIEPEDIA_LAST_CALL
+#     now = time.time()
+#     min_interval = 1.0 / 3.0  # 3 req/sec
+#     elapsed = now - COOKIEPEDIA_LAST_CALL
+
+#     if elapsed < min_interval:
+#         time.sleep(min_interval - elapsed)
+
+#     # random jitter เพื่อลด pattern ที่คงที่เกินไป
+#     time.sleep(random.uniform(0.0, 0.3))
+
+#     COOKIEPEDIA_LAST_CALL = time.time()
 
 
 def check_cookiepedia(cookie_name: str):
@@ -266,8 +296,9 @@ def check_cookiepedia(cookie_name: str):
 
     for attempt in range(max_retries):
         try:
-            _respect_cookiepedia_rate_limit()
-
+            # _respect_cookiepedia_rate_limit()
+            cookiepedia_rate_limit()
+            
             headers = {"User-Agent": USER_AGENT}
             resp = requests.get(url, timeout=20, headers=headers)
 
@@ -499,8 +530,108 @@ def label_cookies_from_db(cookie_batch_size=200):
     cursor.close()
     db.close()
     log_progress("[*] DONE run.")
+    
+def recheck_unknown_cookie(cookie_name, domain, website_url):
+    name = (cookie_name or "").strip()
+    dom  = (domain or "").strip()
+
+    if not name:
+        return None
+
+#############################recheck_unknown_cookie#########################################
+
+    # Try CookieSearch again
+    cs = check_cookiesearch(name)
+    if cs:
+        normalized = normalize_category(cs["label"])
+        if normalized != CATEGORY_UNKNOWN:
+            return {
+                "label": normalized,
+                "source": cs["source"],
+                "url": cs["url"],
+            }
+
+    # Try Cookiepedia again
+    cp = check_cookiepedia(name)
+    if cp:
+        normalized = normalize_category(cp["label"])
+        if normalized != CATEGORY_UNKNOWN:
+            return {
+                "label": normalized,
+                "source": cp["source"],
+                "url": cp["url"],
+            }
+
+    # Still truly unknown
+    return None
+
+def recheck_unknowns_from_db(batch_size=50):
+    db, cursor = get_db()
+
+    cursor.execute("""
+        SELECT COUNT(*) AS total
+        FROM cookies
+        WHERE label = %s
+    """, (CATEGORY_UNKNOWN,))
+    total_unknown = cursor.fetchone()["total"]
+
+    log_progress(f"[*] START recheck UNKNOWN pass: total_unknown={total_unknown}")
+
+    processed = 0
+
+    while True:
+        cursor.execute("""
+            SELECT id, website, name, domain
+            FROM cookies
+            WHERE label = %s
+            LIMIT %s
+        """, (CATEGORY_UNKNOWN, batch_size))
+        rows = cursor.fetchall()
+
+        if not rows:
+            break
+
+        for row in rows:
+            cid     = row["id"]
+            website = row.get("website") or ""
+            name    = row.get("name") or ""
+            domain  = row.get("domain") or ""
+
+            result = recheck_unknown_cookie(
+                cookie_name=name,
+                domain=domain,
+                website_url=website
+            )
+
+            if result:
+                log_progress(
+                    f"  [RECHECK] id={cid} name={name} -> {result['label']} ({result['source']})"
+                )
+
+                cursor.execute("""
+                    UPDATE cookies
+                    SET label = %s,
+                        label_source = %s,
+                        label_source_url = %s
+                    WHERE id = %s
+                """, (
+                    result["label"],
+                    result["source"],
+                    result["url"],
+                    cid
+                ))
+
+        db.commit()
+        processed += len(rows)
+        log_progress(f"[*] Recheck batch committed. processed={processed}")
+
+    cursor.close()
+    db.close()
+    log_progress("[*] DONE recheck UNKNOWN pass.")
 
 
 if __name__ == "__main__":
-    # ปรับ batch size
     label_cookies_from_db(cookie_batch_size=100)
+
+    # Second pass to confirm real UNKNOWNs
+    recheck_unknowns_from_db(batch_size=50)
